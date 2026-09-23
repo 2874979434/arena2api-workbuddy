@@ -70,6 +70,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("arena2api")
 
+
+# 扩展心跳很勤（push 约 30s，弹窗开着时 status 约 2s），access log 刷屏容易
+# 让人点选 Windows 终端触发 Quick Edit，整进程卡死。静默这两条即可。
+class _QuietExtensionAccess(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return "/v1/extension/push" not in msg and "/v1/extension/status" not in msg
+
+
+logging.getLogger("uvicorn.access").addFilter(_QuietExtensionAccess())
+
 # ============================================================
 # 配置
 # ============================================================
@@ -632,6 +643,12 @@ async def chat_completions(request: Request):
     # 获取 reCAPTCHA token：优先 V3（一次性，出池即删），没有则退回 V2
     v3_token = store.pop_v3_token()
     v2_token = store.pop_v2_token() if not v3_token else None
+    # 裸发会被 arena 打成 429 {"error":"prompt failed"}；网页端总能带上新 token
+    if not v3_token and not v2_token:
+        raise HTTPException(
+            503,
+            "No reCAPTCHA token. Keep arena.ai tab open and wait for the extension to refill tokens.",
+        )
 
     # 图片模型走 modality="image"，普通对话是 "chat"
     is_image = model_name in store.image_models
@@ -642,8 +659,8 @@ async def chat_completions(request: Request):
     user_msg_id = uuid7()
     model_a_msg_id = uuid7()
 
-    # mode=direct-battle 表示“直接对战”模式：A 侧只放一个模型，B 侧为空——
-    # 这样 arena.ai 只返回单模型答案，等价于普通聊天（而非对比两个模型）
+    # mode=direct-battle：单模型直聊（扩展打开的是 ?mode=direct）。
+    # 不要带 modelBMessageId——那是 Battle/Side-by-side 双模型投票模式的字段。
     arena_payload = {
         "id": eval_id,
         "mode": "direct-battle",
@@ -662,20 +679,17 @@ async def chat_completions(request: Request):
     if v2_token:
         arena_payload["recaptchaV2Token"] = v2_token
         arena_payload["recaptchaV3Token"] = None
-    elif v3_token:
-        arena_payload["recaptchaV3Token"] = v3_token
     else:
-        # 裸发通常会被 arena.ai 拒绝，这里只告警不中断，让上游错误原样透传给客户端
-        log.warning("No reCAPTCHA token available, sending without token")
+        arena_payload["recaptchaV3Token"] = v3_token
 
-    # 请求头尽量与浏览器一致：origin/referer 指向该评测页面，UA 固定为最新版 Chrome。
+    # 请求头尽量与浏览器一致：origin/referer 指向该评测页面。
     # content-type 特意用 text/plain——arena.ai 前端就是这样发的（避免触发 preflight/校验）。
     headers = {
         "accept": "*/*",
         "content-type": "text/plain;charset=UTF-8",
         "origin": ARENA_BASE,
         "referer": f"{ARENA_BASE}/c/{eval_id}",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36",
     }
     cookie_header = store.build_cookie_header()
     if cookie_header:
