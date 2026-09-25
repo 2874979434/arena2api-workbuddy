@@ -47,6 +47,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import time
@@ -484,14 +485,22 @@ async def list_models(request: Request):
 
 
 def session_key(request: Request, model_name: str) -> str:
-    """X-Session-Id 优先；没有则用模型名哈希，换模型即新会话。"""
-    # 客户端显式带 X-Session-Id 时按它归并会话（推荐：同一会话保持同一 ID）
-    sid = request.headers.get("x-session-id", "").strip()
-    if sid:
-        return sid
-    # 否则退化为「模型名哈希」→ 同一模型的所有请求都落进同一个 arena 会话。
-    # 副作用：同一模型下不同客户端/不同轮次会共用同一段 arena 上下文（会互相串话），
-    # 需要隔离的话就显式传 X-Session-Id。
+    """
+    解析用于归并多轮对话的会话键。
+
+    兼容主流客户端会使用的会话头（按优先级）：
+      - X-Session-Id       （OpenAI 兼容客户端通用写法）
+      - X-Conversation-Id  （WorkBuddy / CodeBuddy 实际使用的头）
+      - X-Chat-Id          （部分客户端使用）
+
+    都没有时退化为「模型名哈希」：同一模型的所有请求落进同一个 arena 会话。
+    注意该兜底策略有副作用——同一模型下不同客户端/不同轮次会共用同一段
+    arena 上下文（会互相串话）；需要隔离请在客户端显式传上面任一头部。
+    """
+    for h in ("x-session-id", "x-conversation-id", "x-chat-id"):
+        sid = request.headers.get(h, "").strip()
+        if sid:
+            return sid
     return hashlib.sha256(model_name.encode()).hexdigest()[:16]
 
 
@@ -513,6 +522,36 @@ def detect_client(request: Request) -> str:
     return "openai"
 
 
+def _build_arena_payload(eval_id: str, model_id: str, prompt: str, modality: str,
+                          v3_token: Optional[str], v2_token: Optional[str]) -> dict:
+    """
+    构造发给 arena.ai 的请求体。
+
+    mode=direct-battle：单模型直聊（扩展打开的是 ?mode=direct）。
+    不要带 modelBMessageId——那是 Battle/Side-by-side 双模型投票模式的字段。
+    """
+    payload = {
+        "id": eval_id,
+        "mode": "direct-battle",
+        "modelAId": model_id,
+        "userMessageId": uuid7(),
+        "modelAMessageId": uuid7(),
+        "userMessage": {
+            "content": prompt,
+            "experimental_attachments": [],   # 附件能力未实现（图片输入未透传），留空数组
+            "metadata": {},
+        },
+        "modality": modality,
+    }
+    # 风控凭据二选一：带 V2 时显式把 V3 置 None（服务端会按此选择校验方式）
+    if v2_token:
+        payload["recaptchaV2Token"] = v2_token
+        payload["recaptchaV3Token"] = None
+    else:
+        payload["recaptchaV3Token"] = v3_token
+    return payload
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """
@@ -528,6 +567,10 @@ async def chat_completions(request: Request):
       7. 取 reCAPTCHA token（优先 V3，退而 V2，都没有就裸发并告警）
       8. 组装 arena 请求体 + 请求头（cookie、Bearer JWT、伪装 UA/origin/referer）
       9. 按 stream 分流到 stream_response() / non_stream_response()
+
+    注意：会话的注册（store.sessions[skey] = eval_id）**不再在这里发生**，
+    而是推迟到 arena.ai 真正返回 200 之后、在响应函数内部完成。这样一旦
+    create-evaluation 中途失败/被取消，不会留下一个脏 eval_id 把后续请求带进 404。
     """
     verify_api_key(request)
     try:
@@ -594,51 +637,39 @@ async def chat_completions(request: Request):
         available = list(store.text_models.keys()) + list(store.image_models.keys())
         raise HTTPException(404, f"Model '{model_name}' not found. Available: {available[:20]}")
 
-    # 构建 prompt（取最后一条 user 消息）
-    # 关键设计：arena.ai 会话已经保存了历史，所以这里**只发最后一轮 user 输入**，
-    # 不把整个 messages 数组重新发一遍（否则上下文会重复）。
-    prompt = ""
+    # 提取最后一条 user 消息内容（arena 会话已保存历史，续接时只发最新一句）
+    user_prompt = ""
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, list):
                 # 多模态消息
                 text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
-                prompt = "\n".join(text_parts)
+                user_prompt = "\n".join(text_parts)
             else:
-                prompt = content
+                user_prompt = content
             break
-    if not prompt:
+    if not user_prompt:
         # 没有 user 消息（例如只有 system）时，退化为取最后一条消息的内容
-        prompt = messages[-1].get("content", "")
+        user_prompt = messages[-1].get("content", "")
 
-    # 同一 session 只把最新一句发给已有 arena 会话；新会话才带上 system
+    # 提取所有 system 消息（新会话 / 回退到 create 时才需要）
+    system_parts = []
+    for m in messages:
+        if m.get("role") != "system":
+            continue
+        content = m.get("content", "")
+        if isinstance(content, list):
+            # 兼容 content 为数组的 system 消息（Anthropic 风格客户端会这样发）
+            content = "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
+        if content:
+            system_parts.append(content)
+    system_prompt = "\n".join(system_parts)
+
+    # 会话续接判断：命中 store.sessions 就 post 到已有 eval，否则新建
     skey = session_key(request, model_name)
     continuing = skey in store.sessions
     log.info("Session resolve: key=%r continue=%s eval_id=%s", skey, continuing, store.sessions.get(skey))
-    if continuing:
-        # 续接：POST 到已有评测 ID，system 提示词不再重复发送（首轮已发过）
-        eval_id = store.sessions[skey]
-        url = f"{ARENA_POST_EVAL}/{eval_id}"
-    else:
-        # 新会话：把所有 system 消息按顺序拼到 prompt 前面
-        system_parts = []
-        for m in messages:
-            if m.get("role") != "system":
-                continue
-            content = m.get("content", "")
-            if isinstance(content, list):
-                # 兼容 content 为数组的 system 消息（Anthropic 风格客户端会这样发）
-                content = "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
-            if content:
-                system_parts.append(content)
-        if system_parts:
-            prompt = "\n".join(system_parts) + "\n\n" + prompt
-        # 自己生成一个 UUIDv7 作为 arena 评测 ID——create-evaluation 接受客户端指定 ID
-        eval_id = uuid7()
-        store.sessions[skey] = eval_id      # 记下来，下一轮才能续接
-        url = ARENA_CREATE_EVAL
-        # 注意：store.sessions 只增不删（出错时才会被 pop），长期运行会缓慢增长
 
     # 获取 reCAPTCHA token：优先 V3（一次性，出池即删），没有则退回 V2
     v3_token = store.pop_v3_token()
@@ -654,33 +685,33 @@ async def chat_completions(request: Request):
     is_image = model_name in store.image_models
     modality = "image" if is_image else "chat"
 
-    # 构建 arena.ai 请求：Cookie + 解析出的 JWT；body 对齐浏览器 text/plain
-    # 每条消息都需要一个 ID，服务端据此关联消息；用 v7 保证同样时间有序
-    user_msg_id = uuid7()
-    model_a_msg_id = uuid7()
+    if continuing:
+        # 续接：POST 到已有评测 ID，system 提示词不再重复发送（首轮已发过）
+        eval_id = store.sessions[skey]
+        url = f"{ARENA_POST_EVAL}/{eval_id}"
+        arena_payload = _build_arena_payload(eval_id, model_id, user_prompt, modality, v3_token, v2_token)
+        register_session = False
 
-    # mode=direct-battle：单模型直聊（扩展打开的是 ?mode=direct）。
-    # 不要带 modelBMessageId——那是 Battle/Side-by-side 双模型投票模式的字段。
-    arena_payload = {
-        "id": eval_id,
-        "mode": "direct-battle",
-        "modelAId": model_id,
-        "userMessageId": user_msg_id,
-        "modelAMessageId": model_a_msg_id,
-        "userMessage": {
-            "content": prompt,
-            "experimental_attachments": [],   # 附件能力未实现（图片输入未透传），留空数组
-            "metadata": {},
-        },
-        "modality": modality,
-    }
-
-    # 风控凭据二选一：带 V2 时显式把 V3 置 None（服务端会按此选择校验方式）
-    if v2_token:
-        arena_payload["recaptchaV2Token"] = v2_token
-        arena_payload["recaptchaV3Token"] = None
+        # 404 回退工厂：如果 post 到已有会话发现它在 arena 侧不存在，
+        # 就把这段对话当一个全新会话重新发起（带 system + 当前 user）。
+        # 这里刻意重新弹一次 token——之前弹的可能已经在回退时消耗掉了。
+        def make_fallback():
+            new_eval_id = uuid7()
+            full_prompt = (system_prompt + "\n\n" + user_prompt) if system_prompt else user_prompt
+            new_v3 = store.pop_v3_token()
+            new_v2 = store.pop_v2_token() if not new_v3 else None
+            new_payload = _build_arena_payload(new_eval_id, model_id, full_prompt, modality, new_v3, new_v2)
+            return new_eval_id, new_payload
+        fallback_fn = make_fallback
     else:
-        arena_payload["recaptchaV3Token"] = v3_token
+        # 新会话：把所有 system 消息按顺序拼到 prompt 前面
+        full_prompt = (system_prompt + "\n\n" + user_prompt) if system_prompt else user_prompt
+        # 自己生成一个 UUIDv7 作为 arena 评测 ID——create-evaluation 接受客户端指定 ID
+        eval_id = uuid7()
+        url = ARENA_CREATE_EVAL
+        arena_payload = _build_arena_payload(eval_id, model_id, full_prompt, modality, v3_token, v2_token)
+        register_session = True
+        fallback_fn = None
 
     # 请求头尽量与浏览器一致：origin/referer 指向该评测页面。
     # content-type 特意用 text/plain——arena.ai 前端就是这样发的（避免触发 preflight/校验）。
@@ -705,7 +736,8 @@ async def chat_completions(request: Request):
     if stream:
         # 流式：立刻返回 SSE 响应头，内容由生成器边收边转（首字节延迟最低）
         return StreamingResponse(
-            stream_response(url, arena_payload, headers, model_name, eval_id, client_type, skey),
+            stream_response(url, arena_payload, headers, model_name, eval_id,
+                            client_type, skey, register_session, fallback_fn),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -715,10 +747,13 @@ async def chat_completions(request: Request):
         )
     else:
         # 非流式：先把 arena 的流全部读完再拼成一条完整响应（客户端只需等一次）
-        return await non_stream_response(url, arena_payload, headers, model_name, eval_id, client_type, skey)
+        return await non_stream_response(url, arena_payload, headers, model_name, eval_id,
+                                         client_type, skey, register_session, fallback_fn)
 
 
-async def stream_response(url, payload, headers, model_name, eval_id, client_type="openai", session_key=None):
+async def stream_response(url, payload, headers, model_name, eval_id,
+                          client_type="openai", skey=None,
+                          register_session=False, fallback_fn=None):
     """
     【流式】arena.ai SSE → OpenAI SSE 的转换生成器。
 
@@ -735,138 +770,210 @@ async def stream_response(url, payload, headers, model_name, eval_id, client_typ
         ...
         data: [DONE]
     推理内容放在 delta.reasoning_content（OpenAI 官方无此字段，但被主流客户端/网关识别）。
+
+    重试/回退策略（本函数带 while 循环的原因）：
+      - 429 Too Many Requests：指数退避后重试同一请求，最多 3 次；
+      - post-to-evaluation 返回 404：说明 arena 侧会话被回收，立即以
+        回退工厂构造的全新 create-evaluation 请求重发一次；
+      - 其余非 200：直接把错误写成 data: 帧（HTTP 头已发出，没法再改状态码）。
     """
     # 先让出事件循环，避免建连 arena 前其它请求饿死
     await asyncio.sleep(0)
-    chat_id = f"chatcmpl-{eval_id}"     # 用 eval_id 关联响应与 arena 会话，便于排查
     created = int(time.time())
 
-    try:
-        # timeout=300：大模型长回答可能很久，给足 5 分钟
-        # follow_redirects=True：arena.ai 可能 302 到带地区/实验参数的同路径
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            body = json.dumps(payload, ensure_ascii=False)   # 保留中文原文，不要 \uXXXX
-            # 用 stream() + aiter_lines() 逐行读，避免整段响应驻留内存
-            async with client.stream("POST", url, content=body, headers=headers) as resp:
-                if resp.status_code != 200:
-                    # 上游报错：读完整错误体、记录日志，并把该会话从缓存里摘掉
-                    # （摘掉的原因：这次会话可能在 arena 侧也没建成功，下轮应重新 create）
-                    err = await resp.aread()
-                    log.error(f"Arena API error: {resp.status_code} {err[:500]}")
-                    if session_key:
-                        store.sessions.pop(session_key, None)
-                    # 关键：HTTP 头已经发出去了（SSE 已开始），只能用 data: 帧报错，不能用 HTTP 状态码
-                    error_chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": f"[Error: Arena API returned {resp.status_code}]"},
-                            "finish_reason": "stop",
-                        }],
-                    }
-                    yield f"data: {json.dumps(error_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
+    # 当前请求的可变状态（404 回退 / 429 重试时会更新）
+    current_url = url
+    current_payload = payload
+    current_headers = dict(headers)
+    current_eval_id = eval_id
+    chat_id = f"chatcmpl-{current_eval_id}"
 
-                async for line in resp.aiter_lines():
-                    if not line.strip():
+    fallback_used = False
+    retry_count = 0
+    max_retries = 3
+
+    try:
+        while True:
+            # timeout=300：大模型长回答可能很久，给足 5 分钟
+            # follow_redirects=True：arena.ai 可能 302 到带地区/实验参数的同路径
+            async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+                body = json.dumps(current_payload, ensure_ascii=False)   # 保留中文原文，不要 \uXXXX
+                # 用 stream() + aiter_lines() 逐行读，避免整段响应驻留内存
+                async with client.stream("POST", current_url, content=body, headers=current_headers) as resp:
+                    # ---- 429：指数退避重试（同一个请求，原样重发） ----
+                    if resp.status_code == 429 and retry_count < max_retries:
+                        await resp.aread()
+                        wait = (2 ** retry_count) + random.random()
+                        log.warning("Arena returned 429; backing off %.1fs (attempt %d/%d)",
+                                    wait, retry_count + 1, max_retries)
+                        retry_count += 1
+                        await asyncio.sleep(wait)
                         continue
 
-                    content = None      # 本行要输出的正文增量
-                    reasoning = None    # 本行要输出的推理增量
-                    finish = None       # 非空表示本行之后结束
+                    # ---- 404 且目标是 post-to-evaluation：会话在 arena 侧不存在，回退到 create ----
+                    if (resp.status_code == 404
+                            and current_url.startswith(ARENA_POST_EVAL)
+                            and not fallback_used
+                            and fallback_fn is not None):
+                        await resp.aread()
+                        log.warning("Eval session %s not found on arena.ai; falling back to create-evaluation",
+                                    current_eval_id)
+                        if skey:
+                            store.sessions.pop(skey, None)
+                        new_eval_id, new_payload = fallback_fn()
+                        current_eval_id = new_eval_id
+                        current_url = ARENA_CREATE_EVAL
+                        current_payload = new_payload
+                        current_headers = dict(current_headers)
+                        current_headers["referer"] = f"{ARENA_BASE}/c/{new_eval_id}"
+                        chat_id = f"chatcmpl-{new_eval_id}"
+                        fallback_used = True
+                        register_session = True     # 回退成功后要登记新会话
+                        retry_count = 0
+                        continue
 
-                    if line.startswith("a0:"):
-                        # 文本内容
-                        try:
-                            content = json.loads(line[3:])
-                            if content == "hasArenaError":
-                                # 对端返回了错误标记，转成可见文本并立即结束
-                                content = "[Arena Error]"
-                                finish = "stop"
-                        except json.JSONDecodeError:
-                            continue
-                    elif line.startswith("ag:"):
-                        # 推理内容
-                        try:
-                            reasoning = json.loads(line[3:])
-                        except json.JSONDecodeError:
-                            continue
-                    elif line.startswith("ad:"):
-                        # 完成
-                        finish = "stop"
-                        try:
-                            data = json.loads(line[3:])
-                            if data.get("finishReason"):
-                                finish = data["finishReason"]   # 例如 length / stop
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("a2:"):
-                        # heartbeat 或图片
-                        # 心跳只是保活信号，直接跳过（不要把 "heartbeat" 当内容发出去）
-                        if "heartbeat" in line:
-                            continue
-                        try:
-                            data = json.loads(line[3:])
-                            # 文生图模型：把图片数组渲染成 Markdown 图片链接作为内容
-                            images = [img.get("image") for img in data if img.get("image")]
-                            if images:
-                                content = "\n".join(f"![image]({url})" for url in images)
-                        except json.JSONDecodeError:
-                            continue
-                    elif line.startswith("a3:"):
-                        # 错误
-                        try:
-                            content = f"[Error: {json.loads(line[3:])}]"
-                        except:
-                            # 兜底：JSON 解析失败就原样把载荷贴出来
-                            content = f"[Error: {line[3:]}]"
-                        finish = "stop"
-                    else:
-                        continue    # 不认识的前缀（如元数据行）直接忽略
-
-                    if content is not None:
-                        chunk = {
+                    # ---- 其它非 200：无法重试，直接以 data: 帧报错 ----
+                    if resp.status_code != 200:
+                        err = await resp.aread()
+                        log.error(f"Arena API error: {resp.status_code} {err[:500]}")
+                        if skey:
+                            store.sessions.pop(skey, None)
+                        # 关键：HTTP 头已经发出去了（SSE 已开始），只能用 data: 帧报错，不能用 HTTP 状态码
+                        error_chunk = {
                             "id": chat_id,
                             "object": "chat.completion.chunk",
                             "created": created,
                             "model": model_name,
                             "choices": [{
                                 "index": 0,
-                                "delta": {"content": content},
-                                "finish_reason": None,
+                                "delta": {"content": f"[Error: Arena API returned {resp.status_code}]"},
+                                "finish_reason": "stop",
                             }],
                         }
-                        # Claude/Anthropic 格式兼容
-                        # 说明：这只是给 Anthropic 风格客户端“看起来像”的近似处理，
-                        # 并不是完整的 Messages API 协议（字段结构并不完全等价）
-                        if client_type == "claude":
-                            chunk["type"] = "content_block_delta"
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps(error_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
 
-                    if reasoning is not None:
-                        # 将推理内容作为普通内容输出（或可以用 reasoning_content）
-                        # 用独立字段反馈，避免思考过程混进正文影响客户端渲染
-                        chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"reasoning_content": reasoning},
-                                "finish_reason": None,
-                            }],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                    # ---- 200：会话在 arena 侧确实建立/存在了，此刻才登记 ----
+                    if register_session and skey:
+                        store.sessions[skey] = current_eval_id
+                        log.info("Registered session %r -> %s", skey, current_eval_id)
 
-                    if finish:
-                        # 收尾帧：delta 为空、只带 finish_reason，然后补一个 [DONE]
-                        # 注意这里没有回传 usage（流式模式下 token 统计缺失，部分客户端会显示 0）
-                        chunk = {
+                    got_finish = False
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+
+                        content = None      # 本行要输出的正文增量
+                        reasoning = None    # 本行要输出的推理增量
+                        finish = None       # 非空表示本行之后结束
+
+                        if line.startswith("a0:"):
+                            # 文本内容
+                            try:
+                                content = json.loads(line[3:])
+                                if content == "hasArenaError":
+                                    # 对端返回了错误标记，转成可见文本并立即结束
+                                    content = "[Arena Error]"
+                                    finish = "stop"
+                            except json.JSONDecodeError:
+                                continue
+                        elif line.startswith("ag:"):
+                            # 推理内容
+                            try:
+                                reasoning = json.loads(line[3:])
+                            except json.JSONDecodeError:
+                                continue
+                        elif line.startswith("ad:"):
+                            # 完成
+                            finish = "stop"
+                            try:
+                                data = json.loads(line[3:])
+                                if data.get("finishReason"):
+                                    finish = data["finishReason"]   # 例如 length / stop
+                            except json.JSONDecodeError:
+                                pass
+                        elif line.startswith("a2:"):
+                            # heartbeat 或图片
+                            # 心跳只是保活信号，直接跳过（不要把 "heartbeat" 当内容发出去）
+                            if "heartbeat" in line:
+                                continue
+                            try:
+                                data = json.loads(line[3:])
+                                # 文生图模型：把图片数组渲染成 Markdown 图片链接作为内容
+                                images = [img.get("image") for img in data if img.get("image")]
+                                if images:
+                                    content = "\n".join(f"![image]({u})" for u in images)
+                            except json.JSONDecodeError:
+                                continue
+                        elif line.startswith("a3:"):
+                            # 错误
+                            try:
+                                content = f"[Error: {json.loads(line[3:])}]"
+                            except Exception:
+                                # 兜底：JSON 解析失败就原样把载荷贴出来
+                                content = f"[Error: {line[3:]}]"
+                            finish = "stop"
+                        else:
+                            continue    # 不认识的前缀（如元数据行）直接忽略
+
+                        if content is not None:
+                            chunk = {
+                                "id": chat_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"content": content},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            # Claude/Anthropic 格式兼容
+                            # 说明：这只是给 Anthropic 风格客户端“看起来像”的近似处理，
+                            # 并不是完整的 Messages API 协议（字段结构并不完全等价）
+                            if client_type == "claude":
+                                chunk["type"] = "content_block_delta"
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                        if reasoning is not None:
+                            # 将推理内容通过独立字段反馈，避免思考过程混进正文影响客户端渲染
+                            chunk = {
+                                "id": chat_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"reasoning_content": reasoning},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+                        if finish:
+                            # 收尾帧：delta 为空、只带 finish_reason，然后补一个 [DONE]
+                            # 注意这里没有回传 usage（流式模式下 token 统计缺失，部分客户端会显示 0）
+                            chunk = {
+                                "id": chat_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_name,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": finish if finish != "stop" else "stop",  # 恒等于 finish
+                                }],
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                            yield "data: [DONE]\n\n"
+                            got_finish = True
+                            return
+
+                    # 流结束但 arena 没发 ad:（偶发）——补一个安全收尾，避免客户端一直挂等
+                    if not got_finish:
+                        log.warning("arena stream ended without finish frame; emitting synthetic [DONE]")
+                        final_chunk = {
                             "id": chat_id,
                             "object": "chat.completion.chunk",
                             "created": created,
@@ -874,10 +981,10 @@ async def stream_response(url, payload, headers, model_name, eval_id, client_typ
                             "choices": [{
                                 "index": 0,
                                 "delta": {},
-                                "finish_reason": finish if finish != "stop" else "stop",  # 恒等于 finish
+                                "finish_reason": "stop",
                             }],
                         }
-                        yield f"data: {json.dumps(chunk)}\n\n"
+                        yield f"data: {json.dumps(final_chunk)}\n\n"
                         yield "data: [DONE]\n\n"
                         return
 
@@ -899,7 +1006,9 @@ async def stream_response(url, payload, headers, model_name, eval_id, client_typ
         yield "data: [DONE]\n\n"
 
 
-async def non_stream_response(url, payload, headers, model_name, eval_id, client_type="openai", session_key=None):
+async def non_stream_response(url, payload, headers, model_name, eval_id,
+                              client_type="openai", skey=None,
+                              register_session=False, fallback_fn=None):
     """
     【非流式】响应：内部仍然按 SSE 逐行读 arena.ai（上游只有流式接口），
     但把 a0:/ag:/a2: 的内容全部缓存下来，最后拼成一条标准 OpenAI 响应返回。
@@ -908,67 +1017,119 @@ async def non_stream_response(url, payload, headers, model_name, eval_id, client
       - 富余信息更多：ad: 行里的 finishReason 与 usage 都能取到并回填；
       - 错误可以用真正的 HTTP 状态码返回（不是 data: 帧）；
       - 首字节延迟高：必须等 arena 全部输出完。
+
+    重试/回退策略与 stream_response 相同：429 退避重试，post-to-evaluation 遇
+    404 时回退到 create-evaluation 并重发。
     """
     content_parts = []
     reasoning_parts = []
     finish_reason = "stop"
     usage = {}
 
-    try:
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            body = json.dumps(payload, ensure_ascii=False)
-            async with client.stream("POST", url, content=body, headers=headers) as resp:
-                if resp.status_code != 200:
-                    # 上游失败：记录日志、清掉该会话缓存、把状态码透传给客户端
-                    err = await resp.aread()
-                    log.error(f"Arena API error: {resp.status_code} {err[:500]}")
-                    if session_key:
-                        store.sessions.pop(session_key, None)
-                    raise HTTPException(resp.status_code, f"Arena API error: {err[:200]}")
+    current_url = url
+    current_payload = payload
+    current_headers = dict(headers)
+    current_eval_id = eval_id
 
-                # 与 stream 版同样的前缀解析，区别只是“累积”而不是“逐条下发”
-                async for line in resp.aiter_lines():
-                    if not line.strip():
+    fallback_used = False
+    retry_count = 0
+    max_retries = 3
+
+    try:
+        while True:
+            async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
+                body = json.dumps(current_payload, ensure_ascii=False)
+                async with client.stream("POST", current_url, content=body, headers=current_headers) as resp:
+                    # ---- 429：指数退避后重试同一请求 ----
+                    if resp.status_code == 429 and retry_count < max_retries:
+                        await resp.aread()
+                        wait = (2 ** retry_count) + random.random()
+                        log.warning("Arena returned 429; backing off %.1fs (attempt %d/%d)",
+                                    wait, retry_count + 1, max_retries)
+                        retry_count += 1
+                        await asyncio.sleep(wait)
                         continue
-                    if line.startswith("a0:"):
-                        try:
-                            text = json.loads(line[3:])
-                            # "hasArenaError" 是错误标记，不作为正文
-                            if isinstance(text, str) and text != "hasArenaError":
-                                content_parts.append(text)
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("ag:"):
-                        try:
-                            text = json.loads(line[3:])
-                            if isinstance(text, str):
-                                reasoning_parts.append(text)
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("ad:"):
-                        try:
-                            data = json.loads(line[3:])
-                            if data.get("finishReason"):
-                                finish_reason = data["finishReason"]
-                            if data.get("usage"):
-                                usage = data["usage"]      # 有就回填，没有就用下面的零值占位
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("a2:"):
-                        if "heartbeat" in line:
+
+                    # ---- 404 post-to-evaluation：回退到 create ----
+                    if (resp.status_code == 404
+                            and current_url.startswith(ARENA_POST_EVAL)
+                            and not fallback_used
+                            and fallback_fn is not None):
+                        await resp.aread()
+                        log.warning("Eval session %s not found on arena.ai; falling back to create-evaluation",
+                                    current_eval_id)
+                        if skey:
+                            store.sessions.pop(skey, None)
+                        new_eval_id, new_payload = fallback_fn()
+                        current_eval_id = new_eval_id
+                        current_url = ARENA_CREATE_EVAL
+                        current_payload = new_payload
+                        current_headers = dict(current_headers)
+                        current_headers["referer"] = f"{ARENA_BASE}/c/{new_eval_id}"
+                        fallback_used = True
+                        register_session = True
+                        retry_count = 0
+                        continue
+
+                    # ---- 其它非 200：记录日志、清会话缓存、透传状态码 ----
+                    if resp.status_code != 200:
+                        err = await resp.aread()
+                        log.error(f"Arena API error: {resp.status_code} {err[:500]}")
+                        if skey:
+                            store.sessions.pop(skey, None)
+                        raise HTTPException(resp.status_code, f"Arena API error: {err[:200]}")
+
+                    # ---- 200：会话在 arena 侧确实建立/存在了，登记 ----
+                    if register_session and skey:
+                        store.sessions[skey] = current_eval_id
+                        log.info("Registered session %r -> %s", skey, current_eval_id)
+
+                    # 与 stream 版同样的前缀解析，区别只是“累积”而不是“逐条下发”
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
                             continue
-                        try:
-                            data = json.loads(line[3:])
-                            images = [img.get("image") for img in data if img.get("image")]
-                            for img_url in images:
-                                content_parts.append(f"![image]({img_url})")   # 图片转 Markdown
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("a3:"):
-                        try:
-                            content_parts.append(f"[Error: {json.loads(line[3:])}]")
-                        except:
-                            content_parts.append(f"[Error: {line[3:]}]")
+                        if line.startswith("a0:"):
+                            try:
+                                text = json.loads(line[3:])
+                                # "hasArenaError" 是错误标记，不作为正文
+                                if isinstance(text, str) and text != "hasArenaError":
+                                    content_parts.append(text)
+                            except json.JSONDecodeError:
+                                pass
+                        elif line.startswith("ag:"):
+                            try:
+                                text = json.loads(line[3:])
+                                if isinstance(text, str):
+                                    reasoning_parts.append(text)
+                            except json.JSONDecodeError:
+                                pass
+                        elif line.startswith("ad:"):
+                            try:
+                                data = json.loads(line[3:])
+                                if data.get("finishReason"):
+                                    finish_reason = data["finishReason"]
+                                if data.get("usage"):
+                                    usage = data["usage"]      # 有就回填，没有就用下面的零值占位
+                            except json.JSONDecodeError:
+                                pass
+                        elif line.startswith("a2:"):
+                            if "heartbeat" in line:
+                                continue
+                            try:
+                                data = json.loads(line[3:])
+                                images = [img.get("image") for img in data if img.get("image")]
+                                for img_url in images:
+                                    content_parts.append(f"![image]({img_url})")   # 图片转 Markdown
+                            except json.JSONDecodeError:
+                                pass
+                        elif line.startswith("a3:"):
+                            try:
+                                content_parts.append(f"[Error: {json.loads(line[3:])}]")
+                            except Exception:
+                                content_parts.append(f"[Error: {line[3:]}]")
+
+                    # 读完了一整段，跳出 while
+                    break
 
     except HTTPException:
         raise            # 上面主动抛的 HTTPException 原样上抛，不要被下面的 except 吞掉变 500
@@ -985,7 +1146,7 @@ async def non_stream_response(url, payload, headers, model_name, eval_id, client
         message["reasoning_content"] = full_reasoning
 
     response = {
-        "id": f"chatcmpl-{eval_id}",
+        "id": f"chatcmpl-{current_eval_id}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model_name,
